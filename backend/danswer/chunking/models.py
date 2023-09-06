@@ -5,13 +5,24 @@ from typing import Any
 from typing import cast
 
 from danswer.configs.constants import BLURB
+from danswer.configs.constants import BOOST
 from danswer.configs.constants import METADATA
+from danswer.configs.constants import SCORE
 from danswer.configs.constants import SEMANTIC_IDENTIFIER
 from danswer.configs.constants import SOURCE_LINKS
 from danswer.connectors.models import Document
 from danswer.utils.logger import setup_logger
 
 logger = setup_logger()
+
+
+Embedding = list[float]
+
+
+@dataclass
+class ChunkEmbedding:
+    full_embedding: Embedding
+    mini_chunk_embeddings: list[Embedding]
 
 
 @dataclass
@@ -26,7 +37,7 @@ class BaseChunk:
 
 
 @dataclass
-class IndexChunk(BaseChunk):
+class DocAwareChunk(BaseChunk):
     # During indexing flow, we have access to a complete "Document"
     # During inference we only have access to the document id and do not reconstruct the Document
     source_document: Document
@@ -39,8 +50,8 @@ class IndexChunk(BaseChunk):
 
 
 @dataclass
-class EmbeddedIndexChunk(IndexChunk):
-    embeddings: list[list[float]]
+class IndexChunk(DocAwareChunk):
+    embeddings: ChunkEmbedding
 
 
 @dataclass
@@ -48,6 +59,8 @@ class InferenceChunk(BaseChunk):
     document_id: str
     source_type: str
     semantic_identifier: str
+    boost: int
+    score: float | None
     metadata: dict[str, Any]
 
     @classmethod
@@ -69,6 +82,9 @@ class InferenceChunk(BaseChunk):
             init_kwargs[METADATA] = json.loads(init_kwargs[METADATA])
         else:
             init_kwargs[METADATA] = {}
+        init_kwargs[BOOST] = init_kwargs.get(BOOST, 1)
+        if SCORE not in init_kwargs:
+            init_kwargs[SCORE] = None
         if init_kwargs.get(SEMANTIC_IDENTIFIER) is None:
             logger.error(
                 f"Chunk with blurb: {init_kwargs.get(BLURB, 'Unknown')[:50]}... has no Semantic Identifier"

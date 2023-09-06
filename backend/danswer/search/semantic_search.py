@@ -4,16 +4,20 @@ from uuid import UUID
 import numpy
 from sentence_transformers import SentenceTransformer  # type: ignore
 
-from danswer.chunking.models import EmbeddedIndexChunk
+from danswer.chunking.models import ChunkEmbedding
+from danswer.chunking.models import DocAwareChunk
 from danswer.chunking.models import IndexChunk
 from danswer.chunking.models import InferenceChunk
 from danswer.configs.app_configs import ENABLE_MINI_CHUNK
 from danswer.configs.app_configs import MINI_CHUNK_SIZE
 from danswer.configs.app_configs import NUM_RERANKED_RESULTS
 from danswer.configs.app_configs import NUM_RETURNED_HITS
+from danswer.configs.model_configs import ASYMMETRIC_PREFIX
 from danswer.configs.model_configs import BATCH_SIZE_ENCODE_CHUNKS
+from danswer.configs.model_configs import NORMALIZE_EMBEDDINGS
+from danswer.datastores.datastore_utils import translate_boost_count_to_multiplier
+from danswer.datastores.interfaces import DocumentIndex
 from danswer.datastores.interfaces import IndexFilter
-from danswer.datastores.interfaces import VectorIndex
 from danswer.search.models import Embedder
 from danswer.search.search_utils import get_default_embedding_model
 from danswer.search.search_utils import get_default_reranking_model_ensemble
@@ -33,6 +37,8 @@ def chunks_to_search_docs(chunks: list[InferenceChunk] | None) -> list[SearchDoc
                 link=chunk.source_links.get(0) if chunk.source_links else None,
                 blurb=chunk.blurb,
                 source_type=chunk.source_type,
+                boost=chunk.boost,
+                score=chunk.score,
             )
             # semantic identifier should always exist but for really old indices, it was not enforced
             for chunk in chunks
@@ -54,12 +60,23 @@ def semantic_reranking(
         encoder.predict([(query, chunk.content) for chunk in chunks])  # type: ignore
         for encoder in cross_encoders
     ]
-    averaged_sim_scores = sum(sim_scores) / len(sim_scores)
-    scored_results = list(zip(averaged_sim_scores, chunks))
+
+    shifted_sim_scores = sum(
+        [enc_n_scores - numpy.min(enc_n_scores) for enc_n_scores in sim_scores]
+    ) / len(sim_scores)
+
+    boosts = [translate_boost_count_to_multiplier(chunk.boost) for chunk in chunks]
+    boosted_sim_scores = shifted_sim_scores * boosts
+    scored_results = list(zip(boosted_sim_scores, chunks))
     scored_results.sort(key=lambda x: x[0], reverse=True)
     ranked_sim_scores, ranked_chunks = zip(*scored_results)
 
     logger.debug(f"Reranked similarity scores: {ranked_sim_scores}")
+
+    # Assign new chunk scores based on reranking
+    # TODO if pagination is added, the scores won't make sense with respect to the non-reranked hits
+    for ind, chunk in enumerate(ranked_chunks):
+        chunk.score = ranked_sim_scores[ind]
 
     return list(ranked_chunks)
 
@@ -69,7 +86,7 @@ def retrieve_ranked_documents(
     query: str,
     user_id: UUID | None,
     filters: list[IndexFilter] | None,
-    datastore: VectorIndex,
+    datastore: DocumentIndex,
     num_hits: int = NUM_RETURNED_HITS,
     num_rerank: int = NUM_RERANKED_RESULTS,
 ) -> tuple[list[InferenceChunk] | None, list[InferenceChunk] | None]:
@@ -82,6 +99,7 @@ def retrieve_ranked_documents(
             f"Semantic search returned no results with filters: {filters_log_msg}"
         )
         return None, None
+    logger.info(top_chunks)
     ranked_chunks = semantic_reranking(query, top_chunks[:num_rerank])
 
     top_docs = [
@@ -89,7 +107,10 @@ def retrieve_ranked_documents(
         for ranked_chunk in ranked_chunks
         if ranked_chunk.source_links is not None
     ]
-    files_log_msg = f"Top links from semantic search: {', '.join(top_docs)}"
+
+    files_log_msg = (
+        f"Top links from semantic search: {', '.join(list(dict.fromkeys(top_docs)))}"
+    )
     logger.info(files_log_msg)
 
     return ranked_chunks, top_chunks[num_rerank:]
@@ -127,12 +148,12 @@ def split_chunk_text_into_mini_chunks(
 
 @log_function_time()
 def encode_chunks(
-    chunks: list[IndexChunk],
+    chunks: list[DocAwareChunk],
     embedding_model: SentenceTransformer | None = None,
     batch_size: int = BATCH_SIZE_ENCODE_CHUNKS,
     enable_mini_chunk: bool = ENABLE_MINI_CHUNK,
-) -> list[EmbeddedIndexChunk]:
-    embedded_chunks: list[EmbeddedIndexChunk] = []
+) -> list[IndexChunk]:
+    embedded_chunks: list[IndexChunk] = []
     if embedding_model is None:
         embedding_model = get_default_embedding_model()
 
@@ -154,7 +175,12 @@ def encode_chunks(
 
     embeddings_np: list[numpy.ndarray] = []
     for text_batch in text_batches:
-        embeddings_np.extend(embedding_model.encode(text_batch))
+        # Normalize embeddings is only configured via model_configs.py, be sure to use right value for the set loss
+        embeddings_np.extend(
+            embedding_model.encode(
+                text_batch, normalize_embeddings=NORMALIZE_EMBEDDINGS
+            )
+        )
     embeddings: list[list[float]] = [embedding.tolist() for embedding in embeddings_np]
 
     embedding_ind_start = 0
@@ -163,9 +189,12 @@ def encode_chunks(
         chunk_embeddings = embeddings[
             embedding_ind_start : embedding_ind_start + num_embeddings
         ]
-        new_embedded_chunk = EmbeddedIndexChunk(
+        new_embedded_chunk = IndexChunk(
             **{k: getattr(chunk, k) for k in chunk.__dataclass_fields__},
-            embeddings=chunk_embeddings,
+            embeddings=ChunkEmbedding(
+                full_embedding=chunk_embeddings[0],
+                mini_chunk_embeddings=chunk_embeddings[1:],
+            ),
         )
         embedded_chunks.append(new_embedded_chunk)
         embedding_ind_start += num_embeddings
@@ -173,6 +202,24 @@ def encode_chunks(
     return embedded_chunks
 
 
+def embed_query(
+    query: str,
+    embedding_model: SentenceTransformer | None = None,
+    prefix: str = ASYMMETRIC_PREFIX,
+    normalize_embeddings: bool = NORMALIZE_EMBEDDINGS,
+) -> list[float]:
+    model = embedding_model or get_default_embedding_model()
+    prefixed_query = prefix + query
+    query_embedding = model.encode(
+        prefixed_query, normalize_embeddings=normalize_embeddings
+    )
+
+    if not isinstance(query_embedding, list):
+        query_embedding = query_embedding.tolist()
+
+    return query_embedding
+
+
 class DefaultEmbedder(Embedder):
-    def embed(self, chunks: list[IndexChunk]) -> list[EmbeddedIndexChunk]:
+    def embed(self, chunks: list[DocAwareChunk]) -> list[IndexChunk]:
         return encode_chunks(chunks)

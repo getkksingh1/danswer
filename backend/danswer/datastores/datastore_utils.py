@@ -1,3 +1,4 @@
+import math
 import uuid
 from collections.abc import Callable
 from copy import deepcopy
@@ -5,7 +6,6 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
-from danswer.chunking.models import EmbeddedIndexChunk
 from danswer.chunking.models import IndexChunk
 from danswer.chunking.models import InferenceChunk
 from danswer.configs.constants import PUBLIC_DOC_PAT
@@ -13,10 +13,17 @@ from danswer.connectors.models import IndexAttemptMetadata
 
 
 DEFAULT_BATCH_SIZE = 30
+BOOST_MULTIPLIER = 2  # Try to keep this consistent with Vespa
+
+
+def translate_boost_count_to_multiplier(boost: int) -> float:
+    # Sigmoid function, maxed out at BOOST_MULTIPLIER
+    # 3 here stretches it out so we hit asymptote slower
+    return BOOST_MULTIPLIER / (1 + math.exp(-1 * boost / 3))
 
 
 def get_uuid_from_chunk(
-    chunk: IndexChunk | EmbeddedIndexChunk | InferenceChunk, mini_chunk_ind: int = 0
+    chunk: IndexChunk | InferenceChunk, mini_chunk_ind: int = 0
 ) -> uuid.UUID:
     doc_str = (
         chunk.document_id
@@ -51,14 +58,14 @@ CrossConnectorDocumentMetadataFetchCallable = Callable[
 T = TypeVar("T")
 
 
-def _add_if_not_exists(l: list[T], item: T) -> list[T]:
-    if item in l:
-        return l
-    return l + [item]
+def _add_if_not_exists(obj_list: list[T], item: T) -> list[T]:
+    if item in obj_list:
+        return obj_list
+    return obj_list + [item]
 
 
 def update_cross_connector_document_metadata_map(
-    chunk: IndexChunk | EmbeddedIndexChunk,
+    chunk: IndexChunk,
     cross_connector_document_metadata_map: dict[str, CrossConnectorDocumentMetadata],
     doc_store_cross_connector_document_metadata_fetch_fn: CrossConnectorDocumentMetadataFetchCallable,
     index_attempt_metadata: IndexAttemptMetadata,

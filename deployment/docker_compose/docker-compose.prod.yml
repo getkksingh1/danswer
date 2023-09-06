@@ -11,15 +11,13 @@ services:
       uvicorn danswer.main:app --host 0.0.0.0 --port 8080"
     depends_on:
       - relational_db
-      - vector_db
-      - search_engine
+      - index
     restart: always
     env_file:
       - .env
     environment:
       - POSTGRES_HOST=relational_db
-      - QDRANT_HOST=vector_db
-      - TYPESENSE_HOST=search_engine
+      - VESPA_HOST=index
     volumes:
       - local_dynamic_storage:/home/storage
       - file_connector_tmp_storage:/home/file_connector_storage
@@ -34,14 +32,13 @@ services:
     command: /usr/bin/supervisord
     depends_on:
       - relational_db
-      - vector_db
+      - index
     restart: always
     env_file:
       - .env
     environment:
       - POSTGRES_HOST=relational_db
-      - QDRANT_HOST=vector_db
-      - TYPESENSE_HOST=search_engine
+      - VESPA_HOST=index
     volumes:
       - local_dynamic_storage:/home/storage
       - file_connector_tmp_storage:/home/file_connector_storage
@@ -68,25 +65,14 @@ services:
       - .env
     volumes:
       - db_volume:/var/lib/postgresql/data
-  vector_db:
-    image: qdrant/qdrant:v1.3.0
+  index:
+    image: vespaengine/vespa:8
     restart: always
-    env_file:
-      - .env
-    environment:
-      - QDRANT__TELEMETRY_DISABLED=true
+    ports:
+      - "19071:19071"
+      - "8081:8081"
     volumes:
-      - qdrant_volume:/qdrant/storage
-  search_engine:
-    image: typesense/typesense:0.24.1
-    restart: always
-    # TYPESENSE_API_KEY must be set in .env file
-    environment:
-      - TYPESENSE_DATA_DIR=/typesense/storage
-    env_file:
-      - .env
-    volumes:
-      - typesense_volume:/typesense/storage
+      - vespa_volume:/opt/vespa/var
   nginx:
     image: nginx:1.23.4-alpine
     restart: always
@@ -119,8 +105,7 @@ volumes:
   local_dynamic_storage:
   file_connector_tmp_storage:  # used to store files uploaded by the user temporarily while we are indexing them
   db_volume:
-  qdrant_volume:
-  typesense_volume:
+  vespa_volume:
   model_cache_torch:
   model_cache_nltk:
   model_cache_huggingface:

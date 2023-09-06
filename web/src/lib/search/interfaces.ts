@@ -12,6 +12,10 @@ export const SearchType = {
 };
 export type SearchType = (typeof SearchType)[keyof typeof SearchType];
 
+export interface AnswerPiece {
+  answer_piece: string;
+}
+
 export interface Quote {
   quote: string;
   document_id: string;
@@ -27,6 +31,8 @@ export interface DanswerDocument {
   source_type: ValidSources;
   blurb: string;
   semantic_identifier: string | null;
+  boost: number;
+  score: number;
 }
 
 export interface SearchResponse {
@@ -36,6 +42,7 @@ export interface SearchResponse {
   quotes: Quote[] | null;
   documents: DanswerDocument[] | null;
   error: string | null;
+  queryEventId: number | null;
 }
 
 export interface Source {
@@ -57,6 +64,7 @@ export interface SearchRequestArgs {
   updateSuggestedSearchType: (searchType: SearchType) => void;
   updateSuggestedFlowType: (flowType: FlowType) => void;
   updateError: (error: string) => void;
+  updateQueryEventId: (queryEventID: number) => void;
   selectedSearchType: SearchType | null;
   offset: number | null;
 }
@@ -64,4 +72,9 @@ export interface SearchRequestArgs {
 export interface SearchRequestOverrides {
   searchType?: SearchType;
   offset?: number;
+}
+
+export interface ValidQuestionResponse {
+  answerable: boolean | null;
+  reasoning: string | null;
 }

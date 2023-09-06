@@ -29,6 +29,14 @@ export type ValidStatuses =
   | "in_progress"
   | "not_started";
 
+export interface DocumentBoostStatus {
+  document_id: string;
+  semantic_id: string;
+  link: string;
+  boost: number;
+  hidden: boolean;
+}
+
 // CONNECTORS
 export interface ConnectorBase<T> {
   name: string;
@@ -163,6 +171,11 @@ export interface SlackCredentialJson {
 
 export interface GoogleDriveCredentialJson {
   google_drive_tokens: string;
+}
+
+export interface GoogleDriveServiceAccountCredentialJson {
+  google_drive_service_account_key: string;
+  google_drive_delegated_user: string;
 }
 
 export interface SlabCredentialJson {

@@ -8,26 +8,29 @@ from fastapi import HTTPException
 from fastapi import Request
 from fastapi import Response
 from fastapi import UploadFile
-from fastapi_users.db import SQLAlchemyUserDatabase
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from danswer.auth.schemas import UserRole
 from danswer.auth.users import current_admin_user
 from danswer.auth.users import current_user
 from danswer.configs.app_configs import DISABLE_GENERATIVE_AI
 from danswer.configs.app_configs import GENERATIVE_MODEL_ACCESS_CHECK_FREQ
-from danswer.configs.app_configs import MASK_CREDENTIAL_PREFIX
 from danswer.configs.constants import GEN_AI_API_KEY_STORAGE_KEY
 from danswer.connectors.file.utils import write_temp_files
-from danswer.connectors.google_drive.connector_auth import DB_CREDENTIALS_DICT_KEY
+from danswer.connectors.google_drive.connector_auth import build_service_account_creds
+from danswer.connectors.google_drive.connector_auth import DB_CREDENTIALS_DICT_TOKEN_KEY
+from danswer.connectors.google_drive.connector_auth import delete_google_app_cred
+from danswer.connectors.google_drive.connector_auth import delete_service_account_key
 from danswer.connectors.google_drive.connector_auth import get_auth_url
-from danswer.connectors.google_drive.connector_auth import get_drive_tokens
 from danswer.connectors.google_drive.connector_auth import get_google_app_cred
+from danswer.connectors.google_drive.connector_auth import (
+    get_google_drive_creds_for_authorized_user,
+)
+from danswer.connectors.google_drive.connector_auth import get_service_account_key
 from danswer.connectors.google_drive.connector_auth import (
     update_credential_access_tokens,
 )
 from danswer.connectors.google_drive.connector_auth import upsert_google_app_cred
+from danswer.connectors.google_drive.connector_auth import upsert_service_account_key
 from danswer.connectors.google_drive.connector_auth import verify_csrf
 from danswer.db.connector import create_connector
 from danswer.db.connector import delete_connector
@@ -40,45 +43,45 @@ from danswer.db.connector_credential_pair import get_connector_credential_pair
 from danswer.db.connector_credential_pair import get_connector_credential_pairs
 from danswer.db.connector_credential_pair import remove_credential_from_connector
 from danswer.db.credentials import create_credential
-from danswer.db.credentials import delete_credential
+from danswer.db.credentials import delete_google_drive_service_account_credentials
 from danswer.db.credentials import fetch_credential_by_id
-from danswer.db.credentials import fetch_credentials
-from danswer.db.credentials import update_credential
 from danswer.db.deletion_attempt import check_deletion_attempt_is_allowed
 from danswer.db.deletion_attempt import create_deletion_attempt
 from danswer.db.deletion_attempt import get_deletion_attempts
 from danswer.db.engine import get_session
-from danswer.db.engine import get_sqlalchemy_async_engine
+from danswer.db.feedback import fetch_docs_ranked_by_boost
+from danswer.db.feedback import update_document_boost
 from danswer.db.index_attempt import create_index_attempt
 from danswer.db.index_attempt import get_latest_index_attempts
 from danswer.db.models import DeletionAttempt
 from danswer.db.models import User
 from danswer.direct_qa.llm_utils import check_model_api_key_is_valid
-from danswer.direct_qa.llm_utils import get_default_llm
+from danswer.direct_qa.llm_utils import get_default_qa_model
 from danswer.direct_qa.open_ai import get_gen_ai_api_key
 from danswer.dynamic_configs import get_dynamic_config_store
 from danswer.dynamic_configs.interface import ConfigNotFoundError
 from danswer.server.models import ApiKey
 from danswer.server.models import AuthStatus
 from danswer.server.models import AuthUrl
+from danswer.server.models import BoostDoc
+from danswer.server.models import BoostUpdateRequest
 from danswer.server.models import ConnectorBase
 from danswer.server.models import ConnectorCredentialPairIdentifier
 from danswer.server.models import ConnectorIndexingStatus
 from danswer.server.models import ConnectorSnapshot
-from danswer.server.models import CredentialBase
 from danswer.server.models import CredentialSnapshot
 from danswer.server.models import DeletionAttemptSnapshot
 from danswer.server.models import FileUploadResponse
 from danswer.server.models import GDriveCallback
 from danswer.server.models import GoogleAppCredentials
+from danswer.server.models import GoogleServiceAccountCredentialRequest
+from danswer.server.models import GoogleServiceAccountKey
 from danswer.server.models import IndexAttemptSnapshot
 from danswer.server.models import ObjectCreationIdResponse
 from danswer.server.models import RunConnectorRequest
 from danswer.server.models import StatusResponse
-from danswer.server.models import UserByEmail
 from danswer.server.models import UserRoleResponse
 from danswer.utils.logger import setup_logger
-
 
 router = APIRouter(prefix="/manage")
 logger = setup_logger()
@@ -89,21 +92,43 @@ _GOOGLE_DRIVE_CREDENTIAL_ID_COOKIE_NAME = "google_drive_credential_id"
 """Admin only API endpoints"""
 
 
-@router.patch("/promote-user-to-admin", response_model=None)
-async def promote_admin(
-    user_email: UserByEmail, user: User = Depends(current_admin_user)
+@router.get("/admin/doc-boosts")
+def get_most_boosted_docs(
+    ascending: bool,
+    limit: int,
+    _: User | None = Depends(current_admin_user),
+    db_session: Session = Depends(get_session),
+) -> list[BoostDoc]:
+    boost_docs = fetch_docs_ranked_by_boost(
+        ascending=ascending, limit=limit, db_session=db_session
+    )
+    return [
+        BoostDoc(
+            document_id=doc.id,
+            semantic_id=doc.semantic_id,
+            # source=doc.source,
+            link=doc.link or "",
+            boost=doc.boost,
+            hidden=doc.hidden,
+        )
+        for doc in boost_docs
+    ]
+
+
+@router.post("/admin/doc-boosts")
+def document_boost_update(
+    boost_update: BoostUpdateRequest,
+    _: User | None = Depends(current_admin_user),
+    db_session: Session = Depends(get_session),
 ) -> None:
-    if user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    async with AsyncSession(get_sqlalchemy_async_engine()) as asession:
-        user_db = SQLAlchemyUserDatabase(asession, User)  # type: ignore
-        user_to_promote = await user_db.get_by_email(user_email.user_email)
-        if not user_to_promote:
-            raise HTTPException(status_code=404, detail="User not found")
-        user_to_promote.role = UserRole.ADMIN
-        asession.add(user_to_promote)
-        await asession.commit()
-    return
+    try:
+        update_document_boost(
+            db_session=db_session,
+            document_id=boost_update.document_id,
+            boost=boost_update.boost,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/admin/connector/google-drive/app-credential")
@@ -117,7 +142,7 @@ def check_google_app_credentials_exist(
 
 
 @router.put("/admin/connector/google-drive/app-credential")
-def update_google_app_credentials(
+def upsert_google_app_credentials(
     app_credentials: GoogleAppCredentials, _: User = Depends(current_admin_user)
 ) -> StatusResponse:
     try:
@@ -130,6 +155,84 @@ def update_google_app_credentials(
     )
 
 
+@router.delete("/admin/connector/google-drive/app-credential")
+def delete_google_app_credentials(
+    _: User = Depends(current_admin_user),
+) -> StatusResponse:
+    try:
+        delete_google_app_cred()
+    except ConfigNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return StatusResponse(
+        success=True, message="Successfully deleted Google App Credentials"
+    )
+
+
+@router.get("/admin/connector/google-drive/service-account-key")
+def check_google_service_account_key_exist(
+    _: User = Depends(current_admin_user),
+) -> dict[str, str]:
+    try:
+        return {"service_account_email": get_service_account_key().client_email}
+    except ConfigNotFoundError:
+        raise HTTPException(
+            status_code=404, detail="Google Service Account Key not found"
+        )
+
+
+@router.put("/admin/connector/google-drive/service-account-key")
+def upsert_google_service_account_key(
+    service_account_key: GoogleServiceAccountKey, _: User = Depends(current_admin_user)
+) -> StatusResponse:
+    try:
+        upsert_service_account_key(service_account_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return StatusResponse(
+        success=True, message="Successfully saved Google Service Account Key"
+    )
+
+
+@router.delete("/admin/connector/google-drive/service-account-key")
+def delete_google_service_account_key(
+    _: User = Depends(current_admin_user),
+) -> StatusResponse:
+    try:
+        delete_service_account_key()
+    except ConfigNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return StatusResponse(
+        success=True, message="Successfully deleted Google Service Account Key"
+    )
+
+
+@router.put("/admin/connector/google-drive/service-account-credential")
+def upsert_service_account_credential(
+    service_account_credential_request: GoogleServiceAccountCredentialRequest,
+    user: User = Depends(current_admin_user),
+    db_session: Session = Depends(get_session),
+) -> ObjectCreationIdResponse:
+    """Special API which allows the creation of a credential for a service account.
+    Combines the input with the saved service account key to create an entry in the
+    `Credential` table."""
+    try:
+        credential_base = build_service_account_creds(
+            delegated_user_email=service_account_credential_request.google_drive_delegated_user
+        )
+        print(credential_base)
+    except ConfigNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # first delete all existing service account credentials
+    delete_google_drive_service_account_credentials(user, db_session)
+    return create_credential(
+        credential_data=credential_base, user=user, db_session=db_session
+    )
+
+
 @router.get("/admin/connector/google-drive/check-auth/{credential_id}")
 def check_drive_tokens(
     credential_id: int,
@@ -139,11 +242,13 @@ def check_drive_tokens(
     db_credentials = fetch_credential_by_id(credential_id, user, db_session)
     if (
         not db_credentials
-        or DB_CREDENTIALS_DICT_KEY not in db_credentials.credential_json
+        or DB_CREDENTIALS_DICT_TOKEN_KEY not in db_credentials.credential_json
     ):
         return AuthStatus(authenticated=False)
-    token_json_str = str(db_credentials.credential_json[DB_CREDENTIALS_DICT_KEY])
-    google_drive_creds = get_drive_tokens(token_json_str=token_json_str)
+    token_json_str = str(db_credentials.credential_json[DB_CREDENTIALS_DICT_TOKEN_KEY])
+    google_drive_creds = get_google_drive_creds_for_authorized_user(
+        token_json_str=token_json_str
+    )
     if google_drive_creds is None:
         return AuthStatus(authenticated=False)
     return AuthStatus(authenticated=True)
@@ -220,7 +325,7 @@ def get_connector_indexing_status(
         latest_index_attempt = cc_pair_to_latest_index_attempt.get(
             (connector.id, credential.id)
         )
-        deletion_attemts = deletion_attempts_by_connector.get(connector.id, [])
+        deletion_attempts = deletion_attempts_by_connector.get(connector.id, [])
         indexing_statuses.append(
             ConnectorIndexingStatus(
                 connector=ConnectorSnapshot.from_connector_db_model(connector),
@@ -242,7 +347,7 @@ def get_connector_indexing_status(
                     DeletionAttemptSnapshot.from_deletion_attempt_db_model(
                         deletion_attempt
                     )
-                    for deletion_attempt in deletion_attemts
+                    for deletion_attempt in deletion_attempts
                 ],
                 is_deletable=check_deletion_attempt_is_allowed(
                     connector_credential_pair=cc_pair
@@ -356,7 +461,7 @@ def validate_existing_genai_api_key(
 ) -> None:
     # OpenAI key is only used for generative QA, so no need to validate this
     # if it's turned off or if a non-OpenAI model is being used
-    if DISABLE_GENERATIVE_AI or not get_default_llm().requires_api_key:
+    if DISABLE_GENERATIVE_AI or not get_default_qa_model().requires_api_key:
         return
 
     # Only validate every so often
@@ -571,81 +676,6 @@ def get_connector_by_id(
         time_created=connector.time_created,
         time_updated=connector.time_updated,
         disabled=connector.disabled,
-    )
-
-
-@router.get("/credential")
-def get_credentials(
-    user: User = Depends(current_user),
-    db_session: Session = Depends(get_session),
-) -> list[CredentialSnapshot]:
-    credentials = fetch_credentials(user, db_session)
-    return [
-        CredentialSnapshot.from_credential_db_model(credential)
-        for credential in credentials
-    ]
-
-
-@router.get("/credential/{credential_id}")
-def get_credential_by_id(
-    credential_id: int,
-    user: User = Depends(current_user),
-    db_session: Session = Depends(get_session),
-) -> CredentialSnapshot | StatusResponse[int]:
-    credential = fetch_credential_by_id(credential_id, user, db_session)
-    if credential is None:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Credential {credential_id} does not exist or does not belong to user",
-        )
-
-    return CredentialSnapshot.from_credential_db_model(credential)
-
-
-@router.post("/credential")
-def create_credential_from_model(
-    connector_info: CredentialBase,
-    user: User = Depends(current_user),
-    db_session: Session = Depends(get_session),
-) -> ObjectCreationIdResponse:
-    return create_credential(connector_info, user, db_session)
-
-
-@router.patch("/credential/{credential_id}")
-def update_credential_from_model(
-    credential_id: int,
-    credential_data: CredentialBase,
-    user: User = Depends(current_user),
-    db_session: Session = Depends(get_session),
-) -> CredentialSnapshot | StatusResponse[int]:
-    updated_credential = update_credential(
-        credential_id, credential_data, user, db_session
-    )
-    if updated_credential is None:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Credential {credential_id} does not exist or does not belong to user",
-        )
-
-    return CredentialSnapshot(
-        id=updated_credential.id,
-        credential_json=updated_credential.credential_json,
-        user_id=updated_credential.user_id,
-        public_doc=updated_credential.public_doc,
-        time_created=updated_credential.time_created,
-        time_updated=updated_credential.time_updated,
-    )
-
-
-@router.delete("/credential/{credential_id}")
-def delete_credential_by_id(
-    credential_id: int,
-    user: User = Depends(current_user),
-    db_session: Session = Depends(get_session),
-) -> StatusResponse:
-    delete_credential(credential_id, user, db_session)
-    return StatusResponse(
-        success=True, message="Credential deleted successfully", data=credential_id
     )
 
 

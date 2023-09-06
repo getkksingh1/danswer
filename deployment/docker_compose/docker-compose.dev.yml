@@ -11,8 +11,7 @@ services:
       uvicorn danswer.main:app --host 0.0.0.0 --port 8080"
     depends_on:
       - relational_db
-      - vector_db
-      - search_engine
+      - index
     restart: always
     ports:
       - "8080:8080"
@@ -22,13 +21,13 @@ services:
       - GEN_AI_API_KEY=${GEN_AI_API_KEY:-}
       - GEN_AI_ENDPOINT=${GEN_AI_ENDPOINT:-}
       - GEN_AI_HOST_TYPE=${GEN_AI_HOST_TYPE:-}
+      - NUM_DOCUMENT_TOKENS_FED_TO_GENERATIVE_MODEL=${NUM_DOCUMENT_TOKENS_FED_TO_GENERATIVE_MODEL:-}
       - POSTGRES_HOST=relational_db
-      - QDRANT_HOST=vector_db
-      - TYPESENSE_HOST=search_engine
-      - TYPESENSE_API_KEY=${TYPESENSE_API_KEY:-typesense_api_key}
+      - VESPA_HOST=index
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - DISABLE_AUTH=${DISABLE_AUTH:-True}
       - QA_TIMEOUT=${QA_TIMEOUT:-}
+      - VALID_EMAIL_DOMAINS=${VALID_EMAIL_DOMAINS:-}
       - OAUTH_TYPE=${OAUTH_TYPE:-google}
       - OPENID_CONFIG_URL=${OPENID_CONFIG_URL:-}
       - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID:-}
@@ -52,7 +51,7 @@ services:
     command: /usr/bin/supervisord
     depends_on:
       - relational_db
-      - vector_db
+      - index
     restart: always
     environment:
       - INTERNAL_MODEL_VERSION=${INTERNAL_MODEL_VERSION:-openai-chat-completion}
@@ -61,16 +60,17 @@ services:
       - GEN_AI_ENDPOINT=${GEN_AI_ENDPOINT:-}
       - GEN_AI_HOST_TYPE=${GEN_AI_HOST_TYPE:-}
       - POSTGRES_HOST=relational_db
-      - QDRANT_HOST=vector_db
-      - TYPESENSE_HOST=search_engine
-      - TYPESENSE_API_KEY=${TYPESENSE_API_KEY:-typesense_api_key}
+      - VESPA_HOST=index
       - API_BASE_OPENAI=${API_BASE_OPENAI:-}
       - API_TYPE_OPENAI=${API_TYPE_OPENAI:-}
       - API_VERSION_OPENAI=${API_VERSION_OPENAI:-}
       - AZURE_DEPLOYMENT_ID=${AZURE_DEPLOYMENT_ID:-}
       - CONTINUE_ON_CONNECTOR_FAILURE=${CONTINUE_ON_CONNECTOR_FAILURE:-}
+      - NUM_INDEXING_WORKERS=${NUM_INDEXING_WORKERS:-}
       - DANSWER_BOT_SLACK_APP_TOKEN=${DANSWER_BOT_SLACK_APP_TOKEN:-}
       - DANSWER_BOT_SLACK_BOT_TOKEN=${DANSWER_BOT_SLACK_BOT_TOKEN:-}
+      - DANSWER_BOT_DISABLE_DOCS_ONLY_ANSWER=${DANSWER_BOT_DISABLE_DOCS_ONLY_ANSWER:-}
+      - DANSWER_BOT_DISPLAY_ERROR_MSGS=${DANSWER_BOT_DISPLAY_ERROR_MSGS:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
       - local_dynamic_storage:/home/storage
@@ -90,6 +90,7 @@ services:
     restart: always
     environment:
       - INTERNAL_URL=http://api_server:8080
+      - WEB_DOMAIN=${WEB_DOMAIN:-}
       - DISABLE_AUTH=${DISABLE_AUTH:-True}
       - OAUTH_NAME=${OAUTH_NAME:-}
   relational_db:
@@ -102,25 +103,14 @@ services:
       - "5432:5432"
     volumes:
       - db_volume:/var/lib/postgresql/data
-  vector_db:
-    image: qdrant/qdrant:v1.3.0
+  index:
+    image: vespaengine/vespa:8
     restart: always
-    environment:
-      - QDRANT__TELEMETRY_DISABLED=true
     ports:
-      - "6333:6333"
+      - "19071:19071"
+      - "8081:8081"
     volumes:
-      - qdrant_volume:/qdrant/storage
-  search_engine:
-    image: typesense/typesense:0.24.1
-    restart: always
-    environment:
-      - TYPESENSE_API_KEY=${TYPESENSE_API_KEY:-typesense_api_key}
-      - TYPESENSE_DATA_DIR=/typesense/storage
-    ports:
-      - "8108:8108"
-    volumes:
-      - typesense_volume:/typesense/storage
+      - vespa_volume:/opt/vespa/var
   nginx:
     image: nginx:1.23.4-alpine
     restart: always
@@ -143,8 +133,7 @@ volumes:
   local_dynamic_storage:
   file_connector_tmp_storage:  # used to store files uploaded by the user temporarily while we are indexing them
   db_volume:
-  qdrant_volume:
-  typesense_volume:
+  vespa_volume:
   model_cache_torch:
   model_cache_nltk:
   model_cache_huggingface:

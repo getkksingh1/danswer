@@ -1,11 +1,14 @@
+import os
 from collections.abc import Callable
 from collections.abc import Collection
 from datetime import datetime
 from datetime import timezone
 from typing import Any
+from typing import cast
 from urllib.parse import urlparse
 
 from atlassian import Confluence  # type:ignore
+from requests import HTTPError
 
 from danswer.configs.app_configs import CONTINUE_ON_CONNECTOR_FAILURE
 from danswer.configs.app_configs import INDEX_BATCH_SIZE
@@ -100,12 +103,48 @@ class ConfluenceConnector(LoadConnector, PollConnector):
         start_ind: int,
     ) -> Collection[dict[str, Any]]:
         def _fetch(start_ind: int, batch_size: int) -> Collection[dict[str, Any]]:
-            return confluence_client.get_all_pages_from_space(
-                self.space,
-                start=start_ind,
-                limit=batch_size,
-                expand="body.storage.value,version",
-            )
+            try:
+                return confluence_client.get_all_pages_from_space(
+                    self.space,
+                    start=start_ind,
+                    limit=batch_size,
+                    expand="body.storage.value,version",
+                )
+            except Exception:
+                logger.warning(
+                    f"Batch failed with space {self.space} at offset {start_ind} "
+                    f"with size {batch_size}, processing pages individually..."
+                )
+
+                view_pages: list[dict[str, Any]] = []
+                for i in range(self.batch_size):
+                    try:
+                        # Could be that one of the pages here failed due to this bug:
+                        # https://jira.atlassian.com/browse/CONFCLOUD-76433
+                        view_pages.extend(
+                            confluence_client.get_all_pages_from_space(
+                                self.space,
+                                start=start_ind + i,
+                                limit=1,
+                                expand="body.storage.value,version",
+                            )
+                        )
+                    except HTTPError as e:
+                        logger.warning(
+                            f"Page failed with space {self.space} at offset {start_ind + i}, "
+                            f"trying alternative expand option: {e}"
+                        )
+                        # Use view instead, which captures most info but is less complete
+                        view_pages.extend(
+                            confluence_client.get_all_pages_from_space(
+                                self.space,
+                                start=start_ind + i,
+                                limit=1,
+                                expand="body.view.value,version",
+                            )
+                        )
+
+                return view_pages
 
         try:
             return _fetch(start_ind, self.batch_size)
@@ -118,24 +157,26 @@ class ConfluenceConnector(LoadConnector, PollConnector):
         for i in range(self.batch_size):
             try:
                 pages.extend(_fetch(start_ind + i, 1))
-            except:
+            except Exception:
                 logger.exception(
                     "Ran into exception when fetching pages from Confluence"
                 )
 
         return pages
 
-    def _fetch_comments(
-        self, confluence_client: Confluence, page_id: str
-    ) -> Collection[dict[str, Any]]:
+    def _fetch_comments(self, confluence_client: Confluence, page_id: str) -> str:
         try:
-            return confluence_client.get_page_child_by_type(
-                page_id,
-                type="comment",
-                start=None,
-                limit=None,
-                expand="body.storage.value",
+            comment_pages = cast(
+                Collection[dict[str, Any]],
+                confluence_client.get_page_child_by_type(
+                    page_id,
+                    type="comment",
+                    start=None,
+                    limit=None,
+                    expand="body.storage.value",
+                ),
             )
+            return _comment_dfs("", comment_pages, confluence_client)
         except Exception as e:
             if not self.continue_on_failure:
                 raise e
@@ -143,7 +184,7 @@ class ConfluenceConnector(LoadConnector, PollConnector):
             logger.exception(
                 "Ran into exception when fetching comments from Confluence"
             )
-            return []
+            return ""
 
     def _get_doc_batch(
         self, start_ind: int, time_filter: Callable[[datetime], bool] | None = None
@@ -159,15 +200,20 @@ class ConfluenceConnector(LoadConnector, PollConnector):
             last_modified = datetime.fromisoformat(last_modified_str)
 
             if time_filter is None or time_filter(last_modified):
-                page_html = page["body"]["storage"]["value"]
+                page_html = (
+                    page["body"]
+                    .get("storage", page["body"].get("view", {}))
+                    .get("value")
+                )
+                page_url = self.wiki_base + page["_links"]["webui"]
+                if not page_html:
+                    logger.debug("Page is empty, skipping: %s", page_url)
+                    continue
                 page_text = (
                     page.get("title", "") + "\n" + parse_html_page_basic(page_html)
                 )
-                comment_pages = self._fetch_comments(self.confluence_client, page["id"])
-                comments_text = _comment_dfs("", comment_pages, self.confluence_client)
+                comments_text = self._fetch_comments(self.confluence_client, page["id"])
                 page_text += comments_text
-
-                page_url = self.wiki_base + page["_links"]["webui"]
 
                 doc_batch.append(
                     Document(
@@ -217,3 +263,15 @@ class ConfluenceConnector(LoadConnector, PollConnector):
 
             if num_pages < self.batch_size:
                 break
+
+
+if __name__ == "__main__":
+    connector = ConfluenceConnector(os.environ["CONFLUENCE_TEST_SPACE_URL"])
+    connector.load_credentials(
+        {
+            "confluence_username": os.environ["CONFLUENCE_USER_NAME"],
+            "confluence_access_token": os.environ["CONFLUENCE_ACCESS_TOKEN"],
+        }
+    )
+    document_batches = connector.load_from_state()
+    print(next(document_batches))

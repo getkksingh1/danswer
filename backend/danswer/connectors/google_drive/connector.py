@@ -1,14 +1,17 @@
 import datetime
 import io
 import tempfile
-from collections.abc import Generator
+from collections.abc import Iterator
 from collections.abc import Sequence
+from enum import Enum
 from itertools import chain
 from typing import Any
+from typing import cast
 
 import docx2txt  # type:ignore
-from google.oauth2.credentials import Credentials  # type: ignore
+from google.auth.credentials import Credentials  # type: ignore
 from googleapiclient import discovery  # type: ignore
+from googleapiclient.errors import HttpError  # type: ignore
 from PyPDF2 import PdfReader
 
 from danswer.configs.app_configs import CONTINUE_ON_CONNECTOR_FAILURE
@@ -16,33 +19,44 @@ from danswer.configs.app_configs import GOOGLE_DRIVE_FOLLOW_SHORTCUTS
 from danswer.configs.app_configs import GOOGLE_DRIVE_INCLUDE_SHARED
 from danswer.configs.app_configs import INDEX_BATCH_SIZE
 from danswer.configs.constants import DocumentSource
-from danswer.connectors.google_drive.connector_auth import DB_CREDENTIALS_DICT_KEY
-from danswer.connectors.google_drive.connector_auth import get_drive_tokens
+from danswer.configs.constants import IGNORE_FOR_QA
+from danswer.connectors.google_drive.connector_auth import (
+    get_google_drive_creds_for_authorized_user,
+)
+from danswer.connectors.google_drive.connector_auth import (
+    get_google_drive_creds_for_service_account,
+)
+from danswer.connectors.google_drive.constants import (
+    DB_CREDENTIALS_DICT_DELEGATED_USER_KEY,
+)
+from danswer.connectors.google_drive.constants import (
+    DB_CREDENTIALS_DICT_SERVICE_ACCOUNT_KEY,
+)
+from danswer.connectors.google_drive.constants import DB_CREDENTIALS_DICT_TOKEN_KEY
 from danswer.connectors.interfaces import GenerateDocumentsOutput
 from danswer.connectors.interfaces import LoadConnector
 from danswer.connectors.interfaces import PollConnector
 from danswer.connectors.interfaces import SecondsSinceUnixEpoch
 from danswer.connectors.models import Document
 from danswer.connectors.models import Section
-from danswer.connectors.utils import batch_generator
+from danswer.utils.batching import batch_generator
 from danswer.utils.logger import setup_logger
 
 logger = setup_logger()
 
-# allow 10 minutes for modifiedTime to get propogated
+# allow 10 minutes for modifiedTime to get propagated
 DRIVE_START_TIME_OFFSET = 60 * 10
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/drive.metadata.readonly",
-]
-SUPPORTED_DRIVE_DOC_TYPES = [
-    "application/vnd.google-apps.document",
-    "application/vnd.google-apps.spreadsheet",
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-]
 DRIVE_FOLDER_TYPE = "application/vnd.google-apps.folder"
 DRIVE_SHORTCUT_TYPE = "application/vnd.google-apps.shortcut"
+UNSUPPORTED_FILE_TYPE_CONTENT = ""  # keep empty for now
+
+
+class GDriveMimeType(str, Enum):
+    DOC = "application/vnd.google-apps.document"
+    SPREADSHEET = "application/vnd.google-apps.spreadsheet"
+    PDF = "application/pdf"
+    WORD_DOC = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
 
 GoogleDriveFileType = dict[str, Any]
 
@@ -50,10 +64,11 @@ GoogleDriveFileType = dict[str, Any]
 def _run_drive_file_query(
     service: discovery.Resource,
     query: str,
+    continue_on_failure: bool,
     include_shared: bool = GOOGLE_DRIVE_INCLUDE_SHARED,
     follow_shortcuts: bool = GOOGLE_DRIVE_FOLLOW_SHORTCUTS,
     batch_size: int = INDEX_BATCH_SIZE,
-) -> Generator[GoogleDriveFileType, None, None]:
+) -> Iterator[GoogleDriveFileType]:
     next_page_token = ""
     while next_page_token is not None:
         logger.debug(f"Running Google Drive fetch with query: {query}")
@@ -76,12 +91,20 @@ def _run_drive_file_query(
         files = results["files"]
         for file in files:
             if follow_shortcuts and "shortcutDetails" in file:
-                file = service.files().get(
-                    fileId=file["shortcutDetails"]["targetId"],
-                    supportsAllDrives=include_shared,
-                    fields="mimeType, id, name, webViewLink, shortcutDetails",
-                )
-                file = file.execute()
+                try:
+                    file = service.files().get(
+                        fileId=file["shortcutDetails"]["targetId"],
+                        supportsAllDrives=include_shared,
+                        fields="mimeType, id, name, webViewLink, shortcutDetails",
+                    )
+                    file = file.execute()
+                except HttpError:
+                    logger.error(
+                        f"Failed to follow shortcut with details: {file['shortcutDetails']}"
+                    )
+                    if continue_on_failure:
+                        continue
+                    raise
             yield file
 
 
@@ -125,11 +148,12 @@ def _get_folder_id(
 
 def _get_folders(
     service: discovery.Resource,
+    continue_on_failure: bool,
     folder_id: str | None = None,  # if specified, only fetches files within this folder
     include_shared: bool = GOOGLE_DRIVE_INCLUDE_SHARED,
     follow_shortcuts: bool = GOOGLE_DRIVE_FOLLOW_SHORTCUTS,
     batch_size: int = INDEX_BATCH_SIZE,
-) -> Generator[GoogleDriveFileType, None, None]:
+) -> Iterator[GoogleDriveFileType]:
     query = f"mimeType = '{DRIVE_FOLDER_TYPE}' "
     if follow_shortcuts:
         query = "(" + query + f" or mimeType = '{DRIVE_SHORTCUT_TYPE}'" + ") "
@@ -141,6 +165,7 @@ def _get_folders(
     for file in _run_drive_file_query(
         service=service,
         query=query,
+        continue_on_failure=continue_on_failure,
         include_shared=include_shared,
         follow_shortcuts=follow_shortcuts,
         batch_size=batch_size,
@@ -155,14 +180,14 @@ def _get_folders(
 
 def _get_files(
     service: discovery.Resource,
+    continue_on_failure: bool,
     time_range_start: SecondsSinceUnixEpoch | None = None,
     time_range_end: SecondsSinceUnixEpoch | None = None,
     folder_id: str | None = None,  # if specified, only fetches files within this folder
     include_shared: bool = GOOGLE_DRIVE_INCLUDE_SHARED,
     follow_shortcuts: bool = GOOGLE_DRIVE_FOLLOW_SHORTCUTS,
-    supported_drive_doc_types: list[str] = SUPPORTED_DRIVE_DOC_TYPES,
     batch_size: int = INDEX_BATCH_SIZE,
-) -> Generator[GoogleDriveFileType, None, None]:
+) -> Iterator[GoogleDriveFileType]:
     query = f"mimeType != '{DRIVE_FOLDER_TYPE}' "
     if time_range_start is not None:
         time_start = (
@@ -179,17 +204,18 @@ def _get_files(
     files = _run_drive_file_query(
         service=service,
         query=query,
+        continue_on_failure=continue_on_failure,
         include_shared=include_shared,
         follow_shortcuts=follow_shortcuts,
         batch_size=batch_size,
     )
-    for file in files:
-        if file["mimeType"] in supported_drive_doc_types:
-            yield file
+
+    return files
 
 
 def get_all_files_batched(
     service: discovery.Resource,
+    continue_on_failure: bool,
     include_shared: bool = GOOGLE_DRIVE_INCLUDE_SHARED,
     follow_shortcuts: bool = GOOGLE_DRIVE_FOLLOW_SHORTCUTS,
     batch_size: int = INDEX_BATCH_SIZE,
@@ -200,12 +226,13 @@ def get_all_files_batched(
     # Only applies if folder_id is specified.
     traverse_subfolders: bool = True,
     folder_ids_traversed: list[str] | None = None,
-) -> Generator[list[GoogleDriveFileType], None, None]:
+) -> Iterator[list[GoogleDriveFileType]]:
     """Gets all files matching the criteria specified by the args from Google Drive
     in batches of size `batch_size`.
     """
-    valid_files = _get_files(
+    found_files = _get_files(
         service=service,
+        continue_on_failure=continue_on_failure,
         time_range_start=time_range_start,
         time_range_end=time_range_end,
         folder_id=folder_id,
@@ -214,7 +241,7 @@ def get_all_files_batched(
         batch_size=batch_size,
     )
     yield from batch_generator(
-        items=valid_files,
+        items=found_files,
         batch_size=batch_size,
         pre_batch_yield=lambda batch_files: logger.info(
             f"Parseable Documents in batch: {[file['name'] for file in batch_files]}"
@@ -226,6 +253,7 @@ def get_all_files_batched(
         subfolders = _get_folders(
             service=service,
             folder_id=folder_id,
+            continue_on_failure=continue_on_failure,
             include_shared=include_shared,
             follow_shortcuts=follow_shortcuts,
             batch_size=batch_size,
@@ -236,6 +264,7 @@ def get_all_files_batched(
                 folder_ids_traversed.append(subfolder["id"])
                 yield from get_all_files_batched(
                     service=service,
+                    continue_on_failure=continue_on_failure,
                     include_shared=include_shared,
                     follow_shortcuts=follow_shortcuts,
                     batch_size=batch_size,
@@ -253,36 +282,45 @@ def get_all_files_batched(
 
 def extract_text(file: dict[str, str], service: discovery.Resource) -> str:
     mime_type = file["mimeType"]
-    if mime_type == "application/vnd.google-apps.document":
+    if mime_type not in set(item.value for item in GDriveMimeType):
+        # Unsupported file types can still have a title, finding this way is still useful
+        return UNSUPPORTED_FILE_TYPE_CONTENT
+
+    if mime_type == GDriveMimeType.DOC.value:
         return (
             service.files()
             .export(fileId=file["id"], mimeType="text/plain")
             .execute()
             .decode("utf-8")
         )
-    elif mime_type == "application/vnd.google-apps.spreadsheet":
+    elif mime_type == GDriveMimeType.SPREADSHEET.value:
         return (
             service.files()
             .export(fileId=file["id"], mimeType="text/csv")
             .execute()
             .decode("utf-8")
         )
-    elif (
-        mime_type
-        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ):
+    elif mime_type == GDriveMimeType.WORD_DOC.value:
         response = service.files().get_media(fileId=file["id"]).execute()
         word_stream = io.BytesIO(response)
         with tempfile.NamedTemporaryFile(delete=False) as temp:
             temp.write(word_stream.getvalue())
             temp_path = temp.name
         return docx2txt.process(temp_path)
-    # Default download to PDF since most types can be exported as a PDF
-    else:
+    elif mime_type == GDriveMimeType.PDF.value:
         response = service.files().get_media(fileId=file["id"]).execute()
         pdf_stream = io.BytesIO(response)
         pdf_reader = PdfReader(pdf_stream)
+
+        if pdf_reader.is_encrypted:
+            logger.warning(
+                f"Google drive file: {file['name']} is encrypted - Danswer will ignore it's content"
+            )
+            return ""
+
         return "\n".join(page.extract_text() for page in pdf_reader.pages)
+
+    return UNSUPPORTED_FILE_TYPE_CONTENT
 
 
 class GoogleDriveConnector(LoadConnector, PollConnector):
@@ -335,16 +373,51 @@ class GoogleDriveConnector(LoadConnector, PollConnector):
 
         return folder_ids
 
-    def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
-        access_token_json_str = credentials[DB_CREDENTIALS_DICT_KEY]
-        creds = get_drive_tokens(token_json_str=access_token_json_str)
+    def load_credentials(self, credentials: dict[str, Any]) -> dict[str, str] | None:
+        """Checks for two different types of credentials.
+        (1) A credential which holds a token acquired via a user going thorugh
+        the Google OAuth flow.
+        (2) A credential which holds a service account key JSON file, which
+        can then be used to impersonate any user in the workspace.
+        """
+        creds = None
+        new_creds_dict = None
+        if DB_CREDENTIALS_DICT_TOKEN_KEY in credentials:
+            access_token_json_str = cast(
+                str, credentials[DB_CREDENTIALS_DICT_TOKEN_KEY]
+            )
+            creds = get_google_drive_creds_for_authorized_user(
+                token_json_str=access_token_json_str
+            )
+
+            # tell caller to update token stored in DB if it has changed
+            # (e.g. the token has been refreshed)
+            new_creds_json_str = creds.to_json() if creds else ""
+            if new_creds_json_str != access_token_json_str:
+                new_creds_dict = {DB_CREDENTIALS_DICT_TOKEN_KEY: new_creds_json_str}
+
+        if DB_CREDENTIALS_DICT_SERVICE_ACCOUNT_KEY in credentials:
+            service_account_key_json_str = credentials[
+                DB_CREDENTIALS_DICT_SERVICE_ACCOUNT_KEY
+            ]
+            creds = get_google_drive_creds_for_service_account(
+                service_account_key_json_str=service_account_key_json_str
+            )
+
+            # "Impersonate" a user if one is specified
+            delegated_user_email = cast(
+                str | None, credentials.get(DB_CREDENTIALS_DICT_DELEGATED_USER_KEY)
+            )
+            if delegated_user_email:
+                creds = creds.with_subject(delegated_user_email) if creds else None
+
         if creds is None:
-            raise PermissionError("Unable to access Google Drive.")
+            raise PermissionError(
+                "Unable to access Google Drive - unknown credential structure."
+            )
+
         self.creds = creds
-        new_creds_json_str = creds.to_json()
-        if new_creds_json_str != access_token_json_str:
-            return {DB_CREDENTIALS_DICT_KEY: new_creds_json_str}
-        return None
+        return new_creds_dict
 
     def _fetch_docs_from_drive(
         self,
@@ -365,6 +438,7 @@ class GoogleDriveConnector(LoadConnector, PollConnector):
             *[
                 get_all_files_batched(
                     service=service,
+                    continue_on_failure=self.continue_on_failure,
                     include_shared=self.include_shared,
                     follow_shortcuts=self.follow_shortcuts,
                     batch_size=self.batch_size,
@@ -381,7 +455,10 @@ class GoogleDriveConnector(LoadConnector, PollConnector):
             for file in files_batch:
                 try:
                     text_contents = extract_text(file, service)
-                    full_context = file["name"] + " - " + text_contents
+                    if text_contents:
+                        full_context = file["name"] + " - " + text_contents
+                    else:
+                        full_context = file["name"]
 
                     doc_batch.append(
                         Document(
@@ -391,7 +468,7 @@ class GoogleDriveConnector(LoadConnector, PollConnector):
                             ],
                             source=DocumentSource.GOOGLE_DRIVE,
                             semantic_identifier=file["name"],
-                            metadata={},
+                            metadata={} if text_contents else {IGNORE_FOR_QA: True},
                         )
                     )
                 except Exception as e:
@@ -417,3 +494,30 @@ class GoogleDriveConnector(LoadConnector, PollConnector):
         yield from self._fetch_docs_from_drive(
             max(start - DRIVE_START_TIME_OFFSET, 0, 0), end
         )
+
+
+if __name__ == "__main__":
+    import json
+    import os
+
+    service_account_json_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY_JSON_PATH")
+    if not service_account_json_path:
+        raise ValueError(
+            "Please set GOOGLE_SERVICE_ACCOUNT_KEY_JSON_PATH environment variable"
+        )
+    with open(service_account_json_path) as f:
+        creds = json.load(f)
+
+    credentials_dict = {
+        DB_CREDENTIALS_DICT_SERVICE_ACCOUNT_KEY: json.dumps(creds),
+    }
+    delegated_user = os.environ.get("GOOGLE_DRIVE_DELEGATED_USER")
+    if delegated_user:
+        credentials_dict[DB_CREDENTIALS_DICT_DELEGATED_USER_KEY] = delegated_user
+
+    connector = GoogleDriveConnector(include_shared=True, follow_shortcuts=True)
+    connector.load_credentials(credentials_dict)
+    document_batch_generator = connector.load_from_state()
+    for document_batch in document_batch_generator:
+        print(document_batch)
+        break

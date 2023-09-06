@@ -1,13 +1,12 @@
 # This file is purely for development use, not included in any builds
 import argparse
 import json
-import urllib
 from pprint import pprint
 
 import requests
 
 from danswer.configs.app_configs import APP_PORT
-from danswer.configs.app_configs import QDRANT_DEFAULT_COLLECTION
+from danswer.configs.app_configs import DOCUMENT_INDEX_NAME
 from danswer.configs.constants import SOURCE_TYPE
 
 
@@ -95,7 +94,7 @@ if __name__ == "__main__":
 
             query_json = {
                 "query": query,
-                "collection": QDRANT_DEFAULT_COLLECTION,
+                "collection": DOCUMENT_INDEX_NAME,
                 "use_keyword": flow_type == "keyword",  # Ignore if not QA Endpoints
                 "filters": [{SOURCE_TYPE: source_types}],
             }

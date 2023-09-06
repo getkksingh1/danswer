@@ -18,6 +18,13 @@ from danswer.utils.logger import setup_logger
 logger = setup_logger()
 
 
+def get_index_attempt(
+    db_session: Session, index_attempt_id: int
+) -> IndexAttempt | None:
+    stmt = select(IndexAttempt).where(IndexAttempt.id == index_attempt_id)
+    return db_session.scalars(stmt).first()
+
+
 def create_index_attempt(
     connector_id: int,
     credential_id: int,
@@ -59,7 +66,7 @@ def mark_attempt_in_progress(
     db_session: Session,
 ) -> None:
     index_attempt.status = IndexingStatus.IN_PROGRESS
-    index_attempt.time_started = index_attempt.time_started or func.now()
+    index_attempt.time_started = index_attempt.time_started or func.now()  # type: ignore
     db_session.add(index_attempt)
     db_session.commit()
 

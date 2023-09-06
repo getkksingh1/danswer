@@ -30,9 +30,8 @@ class BookStackApiClient:
 
         try:
             json = response.json()
-        except:
+        except Exception:
             json = {}
-            pass
 
         if response.status_code >= 300:
             error = response.reason

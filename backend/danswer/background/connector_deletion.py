@@ -1,12 +1,12 @@
 """
 To delete a connector / credential pair:
-(1) find all documents associated with connector / credential pair where there 
+(1) find all documents associated with connector / credential pair where there
 this the is only connector / credential pair that has indexed it
 (2) delete all documents from document stores
 (3) delete all entries from postgres
-(4) find all documents associated with connector / credential pair where there 
+(4) find all documents associated with connector / credential pair where there
 are multiple connector / credential pairs that have indexed it
-(5) update document store entries to remove access associated with the 
+(5) update document store entries to remove access associated with the
 connector / credential pair from the access list
 (6) delete all relevant entries from postgres
 """
@@ -17,26 +17,24 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from danswer.configs.constants import PUBLIC_DOC_PAT
-from danswer.datastores.interfaces import KeywordIndex
-from danswer.datastores.interfaces import StoreType
+from danswer.datastores.document_index import get_default_document_index
+from danswer.datastores.interfaces import DocumentIndex
 from danswer.datastores.interfaces import UpdateRequest
-from danswer.datastores.interfaces import VectorIndex
-from danswer.datastores.qdrant.store import QdrantIndex
-from danswer.datastores.typesense.store import TypesenseIndex
 from danswer.db.connector import fetch_connector_by_id
 from danswer.db.connector_credential_pair import delete_connector_credential_pair
 from danswer.db.connector_credential_pair import get_connector_credential_pair
 from danswer.db.deletion_attempt import check_deletion_attempt_is_allowed
 from danswer.db.deletion_attempt import delete_deletion_attempts
 from danswer.db.deletion_attempt import get_deletion_attempts
-from danswer.db.document import delete_document_by_connector_credential_pair
-from danswer.db.document import delete_documents_complete
-from danswer.db.document import get_chunk_ids_for_document_ids
 from danswer.db.document import (
-    get_chunks_with_single_connector_credential_pair,
+    delete_document_by_connector_credential_pair_for_connector_credential_pair,
 )
+from danswer.db.document import delete_documents_complete
 from danswer.db.document import (
     get_document_by_connector_credential_pairs_indexed_by_multiple,
+)
+from danswer.db.document import (
+    get_documents_with_single_connector_credential_pair,
 )
 from danswer.db.engine import get_sqlalchemy_engine
 from danswer.db.index_attempt import delete_index_attempts
@@ -50,8 +48,7 @@ logger = setup_logger()
 
 def _delete_connector_credential_pair(
     db_session: Session,
-    vector_index: VectorIndex,
-    keyword_index: KeywordIndex,
+    document_index: DocumentIndex,
     deletion_attempt: DeletionAttempt,
 ) -> int:
     connector_id = deletion_attempt.connector_id
@@ -59,40 +56,31 @@ def _delete_connector_credential_pair(
 
     def _delete_singly_indexed_docs() -> int:
         # if a document store entry is only indexed by this connector_credential_pair, delete it
-        num_docs_deleted = 0
-        chunks_to_delete = get_chunks_with_single_connector_credential_pair(
+        docs_to_delete = get_documents_with_single_connector_credential_pair(
             db_session=db_session,
             connector_id=connector_id,
             credential_id=credential_id,
         )
-        if chunks_to_delete:
-            document_ids: set[str] = set()
-            vector_chunk_ids_to_delete: list[str] = []
-            keyword_chunk_ids_to_delete: list[str] = []
-            for chunk in chunks_to_delete:
-                document_ids.add(chunk.document_id)
-                if chunk.document_store_type == StoreType.KEYWORD:
-                    keyword_chunk_ids_to_delete.append(chunk.id)
-                else:
-                    vector_chunk_ids_to_delete.append(chunk.id)
 
-            vector_index.delete(ids=vector_chunk_ids_to_delete)
-            keyword_index.delete(ids=keyword_chunk_ids_to_delete)
-            # removes all `Chunk`, `DocumentByConnectorCredentialPair`, and `Document`
+        if docs_to_delete:
+            document_ids = [doc.id for doc in docs_to_delete]
+            document_index.delete(doc_ids=document_ids)
+
+            # removes all `DocumentByConnectorCredentialPair`, and `Document`
             # rows from the DB
             delete_documents_complete(
                 db_session=db_session,
                 document_ids=list(document_ids),
             )
-            num_docs_deleted += len(document_ids)
-        return num_docs_deleted
+
+        return len(docs_to_delete)
 
     num_docs_deleted = _delete_singly_indexed_docs()
     logger.info(f"Deleted {num_docs_deleted} documents from document stores")
 
     def _update_multi_indexed_docs() -> None:
         # if a document is indexed by multiple connector_credential_pairs, we should
-        # update it's access rather than outright delete it
+        # update its access rather than outright delete it
         document_by_connector_credential_pairs_to_update = (
             get_document_by_connector_credential_pairs_indexed_by_multiple(
                 db_session=db_session,
@@ -104,7 +92,7 @@ def _delete_connector_credential_pair(
         def _get_user(
             credential: Credential,
         ) -> str:
-            if credential.public_doc:
+            if credential.public_doc or not credential.user:
                 return PUBLIC_DOC_PAT
 
             return str(credential.user.id)
@@ -144,23 +132,17 @@ def _delete_connector_credential_pair(
 
         # actually perform the updates in the document store
         update_requests = [
-            UpdateRequest(
-                ids=list(
-                    get_chunk_ids_for_document_ids(
-                        db_session=db_session, document_ids=document_ids
-                    )
-                ),
-                allowed_users=list(allowed_users),
-            )
+            UpdateRequest(document_ids=document_ids, allowed_users=list(allowed_users))
             for allowed_users, document_ids in update_groups.items()
         ]
-        vector_index.update(update_requests=update_requests)
-        keyword_index.update(update_requests=update_requests)
+        document_index.update(update_requests=update_requests)
 
-        # delete the `document_by_connector_credential_pair` rows for the connector / credential pair
-        delete_document_by_connector_credential_pair(
+        # delete the rest of the `document_by_connector_credential_pair` rows for
+        # this connector / credential pair
+        delete_document_by_connector_credential_pair_for_connector_credential_pair(
             db_session=db_session,
-            document_ids=list(document_id_to_allowed_users.keys()),
+            connector_id=connector_id,
+            credential_id=credential_id,
         )
 
     _update_multi_indexed_docs()
@@ -246,8 +228,7 @@ def _run_deletion(db_session: Session) -> None:
     try:
         num_docs_deleted = _delete_connector_credential_pair(
             db_session=db_session,
-            vector_index=QdrantIndex(),
-            keyword_index=TypesenseIndex(),
+            document_index=get_default_document_index(),
             deletion_attempt=deletion_attempt,
         )
     except Exception as e:

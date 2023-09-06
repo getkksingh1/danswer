@@ -10,12 +10,29 @@ import {
   Link,
   Plug,
   Brain,
-  PencilSimple,
   X,
   Question,
+  Users,
 } from "@phosphor-icons/react";
+import {
+  FiCheck,
+  FiChevronsDown,
+  FiChevronsUp,
+  FiEdit,
+  FiFile,
+  FiGlobe,
+  FiThumbsDown,
+  FiThumbsUp,
+  FiChevronDown,
+  FiChevronUp,
+  FiAlertCircle,
+  FiChevronRight,
+  FiChevronLeft,
+  FiAlertTriangle,
+  FiZoomIn,
+  FiCopy,
+} from "react-icons/fi";
 import { SiBookstack } from "react-icons/si";
-import { FaFile, FaGlobe } from "react-icons/fa";
 import Image from "next/image";
 import jiraSVG from "../../../public/Jira.svg";
 import confluenceSVG from "../../../public/Confluence.svg";
@@ -51,6 +68,13 @@ export const KeyIcon = ({
   return <Key size={size} className={className} />;
 };
 
+export const UsersIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <Users size={size} className={className} />;
+};
+
 export const TrashIcon = ({
   size = 16,
   className = defaultTailwindCSS,
@@ -83,14 +107,14 @@ export const GlobeIcon = ({
   size = 16,
   className = defaultTailwindCSS,
 }: IconProps) => {
-  return <FaGlobe size={size} className={className} />;
+  return <FiGlobe size={size} className={className} />;
 };
 
 export const FileIcon = ({
   size = 16,
   className = defaultTailwindCSS,
 }: IconProps) => {
-  return <FaFile size={size} className={className} />;
+  return <FiFile size={size} className={className} />;
 };
 
 export const InfoIcon = ({
@@ -114,11 +138,11 @@ export const BrainIcon = ({
   return <Brain size={size} className={className} />;
 };
 
-export const PencilIcon = ({
+export const EditIcon = ({
   size = 16,
   className = defaultTailwindCSS,
 }: IconProps) => {
-  return <PencilSimple size={size} className={className} />;
+  return <FiEdit size={size} className={className} />;
 };
 
 export const XIcon = ({
@@ -126,6 +150,97 @@ export const XIcon = ({
   className = defaultTailwindCSS,
 }: IconProps) => {
   return <X size={size} className={className} />;
+};
+
+export const ThumbsUpIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiThumbsUp size={size} className={className} />;
+};
+
+export const ThumbsDownIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiThumbsDown size={size} className={className} />;
+};
+
+export const ChevronsUpIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiChevronsUp size={size} className={className} />;
+};
+
+export const ChevronsDownIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiChevronsDown size={size} className={className} />;
+};
+
+export const ChevronUpIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiChevronUp size={size} className={className} />;
+};
+
+export const ChevronDownIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiChevronDown size={size} className={className} />;
+};
+
+export const ChevronRightIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiChevronRight size={size} className={className} />;
+};
+
+export const ChevronLeftIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiChevronLeft size={size} className={className} />;
+};
+
+export const CheckmarkIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiCheck size={size} className={className} />;
+};
+
+export const AlertIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiAlertCircle size={size} className={className} />;
+};
+
+export const TriangleAlertIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiAlertTriangle size={size} className={className} />;
+};
+
+export const ZoomInIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiZoomIn size={size} className={className} />;
+};
+
+export const CopyIcon = ({
+  size = 16,
+  className = defaultTailwindCSS,
+}: IconProps) => {
+  return <FiCopy size={size} className={className} />;
 };
 
 //
@@ -217,7 +332,7 @@ export const ZulipIcon = ({
   return (
     <div
       style={{ width: `${size}px`, height: `${size}px` }}
-      className={`w-[${size}px] h-[${size}px] -m-0.5 ` + className}
+      className={`w-[${size}px] h-[${size}px] ` + className}
     >
       <Image src={zulipIcon} alt="Logo" width="96" height="96" />
     </div>

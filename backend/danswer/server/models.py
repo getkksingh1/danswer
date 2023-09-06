@@ -11,6 +11,9 @@ from pydantic.generics import GenericModel
 
 from danswer.configs.app_configs import MASK_CREDENTIAL_PREFIX
 from danswer.configs.constants import DocumentSource
+from danswer.configs.constants import MessageType
+from danswer.configs.constants import QAFeedbackType
+from danswer.configs.constants import SearchFeedbackType
 from danswer.connectors.models import InputType
 from danswer.datastores.interfaces import IndexFilter
 from danswer.db.models import Connector
@@ -58,6 +61,24 @@ class GoogleAppCredentials(BaseModel):
     web: GoogleAppWebCredentials
 
 
+class GoogleServiceAccountKey(BaseModel):
+    type: str
+    project_id: str
+    private_key_id: str
+    private_key: str
+    client_email: str
+    client_id: str
+    auth_uri: str
+    token_uri: str
+    auth_provider_x509_cert_url: str
+    client_x509_cert_url: str
+    universe_domain: str
+
+
+class GoogleServiceAccountCredentialRequest(BaseModel):
+    google_drive_delegated_user: str | None  # email of user to impersonate
+
+
 class FileUploadResponse(BaseModel):
     file_paths: list[str]
 
@@ -87,12 +108,31 @@ class UserRoleResponse(BaseModel):
     role: str
 
 
+class BoostDoc(BaseModel):
+    document_id: str
+    semantic_id: str
+    link: str
+    boost: int
+    hidden: bool
+
+
+class BoostUpdateRequest(BaseModel):
+    document_id: str
+    boost: int
+
+
 class SearchDoc(BaseModel):
     document_id: str
     semantic_identifier: str
     link: str | None
     blurb: str
     source_type: str
+    boost: int
+    score: float | None
+
+
+class CreateChatID(BaseModel):
+    chat_session_id: int
 
 
 class QuestionRequest(BaseModel):
@@ -103,10 +143,72 @@ class QuestionRequest(BaseModel):
     offset: int | None
 
 
+class QAFeedbackRequest(BaseModel):
+    query_id: int
+    feedback: QAFeedbackType
+
+
+class SearchFeedbackRequest(BaseModel):
+    query_id: int
+    document_id: str
+    document_rank: int
+    click: bool
+    search_feedback: SearchFeedbackType
+
+
+class CreateChatRequest(BaseModel):
+    chat_session_id: int
+    message_number: int
+    parent_edit_number: int | None
+    message: str
+
+
+class ChatMessageIdentifier(BaseModel):
+    chat_session_id: int
+    message_number: int
+    edit_number: int
+
+
+class ChatRenameRequest(BaseModel):
+    chat_session_id: int
+    name: str | None
+    first_message: str | None
+
+
+class RenameChatSessionResponse(BaseModel):
+    new_name: str  # This is only really useful if the name is generated
+
+
+class ChatSessionIdsResponse(BaseModel):
+    sessions: list[int]
+
+
+class ChatMessageDetail(BaseModel):
+    message_number: int
+    edit_number: int
+    parent_edit_number: int | None
+    latest: bool
+    message: str
+    message_type: MessageType
+    time_sent: datetime
+
+
+class ChatSessionDetailResponse(BaseModel):
+    chat_session_id: int
+    description: str
+    messages: list[ChatMessageDetail]
+
+
+class QueryValidationResponse(BaseModel):
+    reasoning: str
+    answerable: bool
+
+
 class SearchResponse(BaseModel):
     # For semantic search, top docs are reranked, the remaining are as ordered from retrieval
     top_ranked_docs: list[SearchDoc] | None
     lower_ranked_docs: list[SearchDoc] | None
+    query_event_id: int
 
 
 class QAResponse(SearchResponse):

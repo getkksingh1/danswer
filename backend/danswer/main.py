@@ -21,23 +21,22 @@ from danswer.configs.app_configs import OAUTH_CLIENT_ID
 from danswer.configs.app_configs import OAUTH_CLIENT_SECRET
 from danswer.configs.app_configs import OAUTH_TYPE
 from danswer.configs.app_configs import OPENID_CONFIG_URL
-from danswer.configs.app_configs import QDRANT_DEFAULT_COLLECTION
 from danswer.configs.app_configs import SECRET
-from danswer.configs.app_configs import TYPESENSE_DEFAULT_COLLECTION
 from danswer.configs.app_configs import WEB_DOMAIN
 from danswer.configs.model_configs import API_BASE_OPENAI
 from danswer.configs.model_configs import API_TYPE_OPENAI
 from danswer.configs.model_configs import GEN_AI_MODEL_VERSION
 from danswer.configs.model_configs import INTERNAL_MODEL_VERSION
-from danswer.datastores.qdrant.indexing import list_qdrant_collections
-from danswer.datastores.typesense.store import check_typesense_collection_exist
-from danswer.datastores.typesense.store import create_typesense_collection
+from danswer.datastores.document_index import get_default_document_index
 from danswer.db.credentials import create_initial_public_credential
-from danswer.direct_qa.llm_utils import get_default_llm
+from danswer.direct_qa.llm_utils import get_default_qa_model
+from danswer.server.chat_backend import router as chat_router
+from danswer.server.credential import router as credential_router
 from danswer.server.event_loading import router as event_processing_router
 from danswer.server.health import router as health_router
 from danswer.server.manage import router as admin_router
 from danswer.server.search_backend import router as backend_router
+from danswer.server.users import router as user_router
 from danswer.utils.logger import setup_logger
 
 
@@ -56,7 +55,7 @@ def validation_exception_handler(
 def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
     try:
         raise (exc)
-    except:
+    except Exception:
         # log stacktrace
         logger.exception("ValueError")
     return JSONResponse(
@@ -68,8 +67,11 @@ def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
 def get_application() -> FastAPI:
     application = FastAPI(title="Internal Search QA Backend", debug=True, version="0.1")
     application.include_router(backend_router)
+    application.include_router(chat_router)
     application.include_router(event_processing_router)
     application.include_router(admin_router)
+    application.include_router(user_router)
+    application.include_router(credential_router)
     application.include_router(health_router)
 
     application.include_router(
@@ -149,7 +151,6 @@ def get_application() -> FastAPI:
         from danswer.search.search_utils import (
             warm_up_models,
         )
-        from danswer.datastores.qdrant.indexing import create_qdrant_collection
 
         if DISABLE_GENERATIVE_AI:
             logger.info("Generative AI Q&A disabled")
@@ -179,7 +180,7 @@ def get_application() -> FastAPI:
 
         logger.info("Warming up local NLP models.")
         warm_up_models()
-        qa_model = get_default_llm()
+        qa_model = get_default_qa_model()
         qa_model.warm_up_model()
 
         logger.info("Verifying query preprocessing (NLTK) data is downloaded")
@@ -190,19 +191,8 @@ def get_application() -> FastAPI:
         logger.info("Verifying public credential exists.")
         create_initial_public_credential()
 
-        logger.info("Verifying Document Indexes are available.")
-        if QDRANT_DEFAULT_COLLECTION not in {
-            collection.name for collection in list_qdrant_collections().collections
-        }:
-            logger.info(
-                f"Creating Qdrant collection with name: {QDRANT_DEFAULT_COLLECTION}"
-            )
-            create_qdrant_collection(collection_name=QDRANT_DEFAULT_COLLECTION)
-        if not check_typesense_collection_exist(TYPESENSE_DEFAULT_COLLECTION):
-            logger.info(
-                f"Creating Typesense collection with name: {TYPESENSE_DEFAULT_COLLECTION}"
-            )
-            create_typesense_collection(collection_name=TYPESENSE_DEFAULT_COLLECTION)
+        logger.info("Verifying Document Index(s) is/are available.")
+        get_default_document_index().ensure_indices_exist()
 
     return application
 
